@@ -86,6 +86,16 @@ func TestRunShellArgs_UnmarshalJSON_AcceptsCmdAndCommand(t *testing.T) {
 			wantCmd: "from-cmd",
 		},
 		{
+			name:    "blank cmd falls back to command alias",
+			input:   `{"cmd":"   ","command":"from-command"}`,
+			wantCmd: "from-command",
+		},
+		{
+			name:    "empty cmd falls back to command alias",
+			input:   `{"cmd":"","command":"from-command"}`,
+			wantCmd: "from-command",
+		},
+		{
 			name:    "empty object leaves cmd empty",
 			input:   `{}`,
 			wantCmd: "",
@@ -115,6 +125,11 @@ func TestRunShellBackgroundArgs_UnmarshalJSON_AcceptsCmdAndCommand(t *testing.T)
 	var viaCommand RunShellBackgroundArgs
 	require.NoError(t, json.Unmarshal([]byte(`{"command":"sleep 1"}`), &viaCommand))
 	assert.Equal(t, "sleep 1", viaCommand.Cmd)
+
+	// A blank "cmd" must not shadow a valid "command" alias.
+	var blankCmd RunShellBackgroundArgs
+	require.NoError(t, json.Unmarshal([]byte(`{"cmd":"   ","command":"sleep 1"}`), &blankCmd))
+	assert.Equal(t, "sleep 1", blankCmd.Cmd)
 }
 
 // Exercises the end-to-end dispatch path: a tool-call whose raw arguments

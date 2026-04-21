@@ -110,7 +110,9 @@ type RunShellArgs struct {
 // models (particularly ones biased by Anthropic's built-in bash tool and other
 // ecosystems that use "command") occasionally emit "command" instead. Accepting
 // both prevents a wasted turn on an empty-command error while keeping the
-// canonical contract unchanged. When both keys are present, "cmd" wins.
+// canonical contract unchanged. When "cmd" is present with a non-blank value
+// it wins; a blank (empty or whitespace-only) "cmd" falls back to "command"
+// so a valid alias is not silently shadowed.
 func (a *RunShellArgs) UnmarshalJSON(data []byte) error {
 	var raw struct {
 		Cmd     string `json:"cmd"`
@@ -121,7 +123,7 @@ func (a *RunShellArgs) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
-	a.Cmd = cmp.Or(raw.Cmd, raw.Command)
+	a.Cmd = preferNonBlank(raw.Cmd, raw.Command)
 	a.Cwd = raw.Cwd
 	a.Timeout = raw.Timeout
 	return nil
@@ -143,9 +145,20 @@ func (a *RunShellBackgroundArgs) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
-	a.Cmd = cmp.Or(raw.Cmd, raw.Command)
+	a.Cmd = preferNonBlank(raw.Cmd, raw.Command)
 	a.Cwd = raw.Cwd
 	return nil
+}
+
+// preferNonBlank returns primary when it has a non-whitespace character;
+// otherwise it returns fallback. The chosen value is returned unmodified so
+// that whitespace inside a legitimate command (e.g. trailing newlines in a
+// heredoc) is preserved.
+func preferNonBlank(primary, fallback string) string {
+	if strings.TrimSpace(primary) != "" {
+		return primary
+	}
+	return fallback
 }
 
 type ViewBackgroundJobArgs struct {
