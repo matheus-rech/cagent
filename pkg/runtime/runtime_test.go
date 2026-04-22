@@ -2222,6 +2222,10 @@ func (p *messageRecordingProvider) CreateChatCompletionStream(_ context.Context,
 	p.recordedMessages = append(p.recordedMessages, snapshot)
 
 	if p.callIdx >= len(p.streams) {
+		// No stream configured for this call index. Return a plain stop so
+		// the caller surfaces this as a test failure via assertion rather
+		// than hanging, but also record the unexpected call so the test can
+		// detect it with require.Len / require.Equal.
 		return newStreamBuilder().AddStopWithUsage(1, 1).Build(), nil
 	}
 	s := p.streams[p.callIdx]
@@ -2274,24 +2278,6 @@ func TestSteer_IdleWindowIsConsumedOnNextTurn(t *testing.T) {
 		events = append(events, ev)
 	}
 
-	// Verify the model received a message containing the steer content.
-	prov.mu.Lock()
-	defer prov.mu.Unlock()
-
-	require.NotEmpty(t, prov.recordedMessages, "expected at least one model call")
-	firstCallMsgs := prov.recordedMessages[0]
-
-	var foundSteer bool
-	for _, m := range firstCallMsgs {
-		if strings.Contains(m.Content, "urgent: change direction") {
-			foundSteer = true
-			break
-		}
-	}
-	assert.True(t, foundSteer,
-		"model should have received the steer message in its first turn; messages seen: %v",
-		firstCallMsgs)
-
 	// The run must complete normally (StreamStopped as the last event).
 	require.NotEmpty(t, events)
 	assert.IsType(t, &StreamStoppedEvent{}, events[len(events)-1],
@@ -2306,6 +2292,46 @@ func TestSteer_IdleWindowIsConsumedOnNextTurn(t *testing.T) {
 		}
 	}
 	assert.True(t, steerEventFound, "expected a UserMessageEvent for the steer message")
+
+	// --- Session-message assertions ---
+	// Find the stored message for the steer injection and verify it was
+	// stored as a plain user message with NO system-reminder envelope.
+	var steerSessionMsg *session.Message
+	for _, item := range sess.Messages {
+		if item.IsMessage() &&
+			item.Message.Message.Role == chat.MessageRoleUser &&
+			strings.Contains(item.Message.Message.Content, "urgent: change direction") {
+			steerSessionMsg = item.Message
+			break
+		}
+	}
+	require.NotNil(t, steerSessionMsg, "expected a user-role session message containing the steer content")
+	assert.Equal(t, "urgent: change direction", steerSessionMsg.Message.Content,
+		"top-of-turn steer must be stored as plain content, not wrapped in system-reminder")
+	assert.NotContains(t, steerSessionMsg.Message.Content, "<system-reminder>",
+		"top-of-turn steer must NOT use the system-reminder envelope")
+
+	// --- Model-call assertions ---
+	// Verify the model received a message containing the raw steer content.
+	prov.mu.Lock()
+	defer prov.mu.Unlock()
+
+	require.NotEmpty(t, prov.recordedMessages, "expected at least one model call")
+	firstCallMsgs := prov.recordedMessages[0]
+
+	var foundSteer bool
+	for _, m := range firstCallMsgs {
+		if strings.Contains(m.Content, "urgent: change direction") {
+			// Also assert the model did NOT receive the system-reminder wrapper.
+			assert.NotContains(t, m.Content, "<system-reminder>",
+				"model must receive raw content, not system-reminder envelope, for top-of-turn steer")
+			foundSteer = true
+			break
+		}
+	}
+	assert.True(t, foundSteer,
+		"model should have received the steer message in its first turn; messages seen: %v",
+		firstCallMsgs)
 }
 
 // TestSteer_EmptySessionBootstrap verifies that when RunStream is started
@@ -2353,8 +2379,37 @@ func TestSteer_EmptySessionBootstrap(t *testing.T) {
 	assert.IsType(t, &StreamStoppedEvent{}, events[len(events)-1],
 		"expected StreamStopped as the final event; got %T", events[len(events)-1])
 
+	// A UserMessageEvent must have been emitted for the steer message.
+	var steerEventFound bool
+	for _, ev := range events {
+		if ue, ok := ev.(*UserMessageEvent); ok && strings.Contains(ue.Message, "bootstrap message") {
+			steerEventFound = true
+			break
+		}
+	}
+	assert.True(t, steerEventFound,
+		"expected a UserMessageEvent for the bootstrap steer message")
+
+	// --- Session-message assertions ---
+	// The stored session message must be plain — no system-reminder envelope.
+	var bootstrapMsg *session.Message
+	for _, item := range sess.Messages {
+		if item.IsMessage() &&
+			item.Message.Message.Role == chat.MessageRoleUser &&
+			strings.Contains(item.Message.Message.Content, "bootstrap message") {
+			bootstrapMsg = item.Message
+			break
+		}
+	}
+	require.NotNil(t, bootstrapMsg, "expected a user-role session message for the bootstrap steer")
+	assert.Equal(t, "bootstrap message", bootstrapMsg.Message.Content,
+		"bootstrap steer must be stored as plain content, not wrapped in system-reminder")
+	assert.NotContains(t, bootstrapMsg.Message.Content, "<system-reminder>",
+		"bootstrap steer must NOT use the system-reminder envelope")
+
+	// --- Model-call assertions ---
 	// The model must have received exactly one call and that call must
-	// contain the bootstrap message.
+	// contain the raw bootstrap message (not wrapped).
 	prov.mu.Lock()
 	defer prov.mu.Unlock()
 
@@ -2366,6 +2421,9 @@ func TestSteer_EmptySessionBootstrap(t *testing.T) {
 	var foundBootstrap bool
 	for _, m := range firstCallMsgs {
 		if strings.Contains(m.Content, "bootstrap message") {
+			// The model must see raw content, not the system-reminder wrapper.
+			assert.NotContains(t, m.Content, "<system-reminder>",
+				"model must receive raw content, not system-reminder envelope, for bootstrap steer")
 			foundBootstrap = true
 			break
 		}
@@ -2373,15 +2431,4 @@ func TestSteer_EmptySessionBootstrap(t *testing.T) {
 	assert.True(t, foundBootstrap,
 		"model must receive the bootstrap steer message as its first (and only) user turn; messages: %v",
 		firstCallMsgs)
-
-	// A UserMessageEvent must have been emitted for the steer message.
-	var steerEventFound bool
-	for _, ev := range events {
-		if ue, ok := ev.(*UserMessageEvent); ok && strings.Contains(ue.Message, "bootstrap message") {
-			steerEventFound = true
-			break
-		}
-	}
-	assert.True(t, steerEventFound,
-		"expected a UserMessageEvent for the bootstrap steer message")
 }

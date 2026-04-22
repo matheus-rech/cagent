@@ -51,6 +51,20 @@ func wrapSteerMessage(content string) string {
 	)
 }
 
+// appendSteerAndEmit appends a steered message to the session and emits the
+// corresponding UserMessage event. When wrap is true the content is enclosed
+// in a <system-reminder> envelope (appropriate for mid-turn interruptions
+// where the agent is actively working); when false the raw content is used
+// (appropriate at the top of a new turn where the agent is idle).
+func (r *LocalRuntime) appendSteerAndEmit(sess *session.Session, sm QueuedMessage, wrap bool, events chan<- Event) {
+	content := sm.Content
+	if wrap {
+		content = wrapSteerMessage(sm.Content)
+	}
+	sess.AddMessage(session.UserMessage(content, sm.MultiContent...))
+	events <- UserMessage(sm.Content, sess.ID, sm.MultiContent, len(sess.Messages)-1)
+}
+
 // finalizeEventChannel performs cleanup at the end of a RunStream goroutine:
 // restores the previous elicitation channel, emits the StreamStopped event,
 // fires hooks, and closes the events channel.
@@ -259,23 +273,6 @@ func (r *LocalRuntime) RunStream(ctx context.Context, sess *session.Session) <-c
 			}
 			slog.Debug("Starting conversation loop iteration", "agent", a.Name())
 
-			// --- STEERING: top-of-turn injection ---
-			// Drain any steer messages that arrived while the runtime was idle
-			// (between RunStream invocations) or before the first model call of
-			// this turn. Without this drain, a Steer call made while no tool
-			// calls are running would be silently dropped when the model returns
-			// a plain-text response with no tool calls.
-			// At this point the agent is not working on anything, so steer
-			// messages are injected as plain user messages — no system-reminder
-			// envelope needed.
-			if steered := r.steerQueue.Drain(ctx); len(steered) > 0 {
-				for _, sm := range steered {
-					userMsg := session.UserMessage(sm.Content, sm.MultiContent...)
-					sess.AddMessage(userMsg)
-					events <- UserMessage(sm.Content, sess.ID, sm.MultiContent, len(sess.Messages)-1)
-				}
-			}
-
 			streamCtx, streamSpan := r.startSpan(ctx, "runtime.stream", trace.WithAttributes(
 				attribute.String("agent", a.Name()),
 				attribute.String("session.id", sess.ID),
@@ -319,6 +316,25 @@ func (r *LocalRuntime) RunStream(ctx context.Context, sess *session.Session) <-c
 				if r.sessionCompaction && compaction.ShouldCompact(sess.InputTokens, sess.OutputTokens, 0, contextLimit) {
 					r.Summarize(ctx, sess, "", events)
 				}
+			}
+
+			// --- STEERING: top-of-turn injection ---
+			// Drain steer messages that arrived while the runtime was idle
+			// (between RunStream invocations) or before the first model call
+			// of this turn. Two gaps in the old code motivated this drain:
+			//   1. Idle-window race: Steer called between RunStream invocations;
+			//      nothing was running to consume the message.
+			//   2. First-turn miss: a plain-text response with no tool calls
+			//      fires res.Stopped before the mid-loop drain is reached.
+			// The agent is not mid-task here, so messages are plain user turns
+			// (no system-reminder envelope). Placement after contextLimit
+			// initialization means compactIfNeeded can be called immediately.
+			if steered := r.steerQueue.Drain(ctx); len(steered) > 0 {
+				messageCountBeforeSteer := len(sess.GetAllMessages())
+				for _, sm := range steered {
+					r.appendSteerAndEmit(sess, sm, false, events)
+				}
+				r.compactIfNeeded(ctx, sess, a, m, contextLimit, messageCountBeforeSteer, events)
 			}
 
 			messages := sess.GetMessages(a)
@@ -451,9 +467,7 @@ func (r *LocalRuntime) RunStream(ctx context.Context, sess *session.Session) <-c
 			// iteration, wrapped in <system-reminder> tags.
 			if steered := r.steerQueue.Drain(ctx); len(steered) > 0 {
 				for _, sm := range steered {
-					userMsg := session.UserMessage(wrapSteerMessage(sm.Content), sm.MultiContent...)
-					sess.AddMessage(userMsg)
-					events <- UserMessage(sm.Content, sess.ID, sm.MultiContent, len(sess.Messages)-1)
+					r.appendSteerAndEmit(sess, sm, true, events)
 				}
 
 				r.compactIfNeeded(ctx, sess, a, m, contextLimit, messageCountBeforeTools, events)
